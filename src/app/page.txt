@@ -1,0 +1,588 @@
+"use client"
+
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import TradingViewChart from "@/components/charts/TradingViewChart";
+import { useMockMarketData, useMockPriceStream } from "@/hooks/useMockData";
+import { useMockSmartSignals } from "@/hooks/useSmartSignals";
+import { TechnicalIndicators } from "@/lib/api/binance";
+
+// ---------------------------------------------
+// Utils & Types
+// ---------------------------------------------
+
+type MACD = { macd: number; signal: number; histogram: number };
+type BB = { upper: number; middle: number; lower: number };
+
+type IndicatorsState = {
+  rsi: number;
+  macd: MACD;
+  bb: BB;
+};
+
+type AlertRule = {
+  id: string;
+  pair: string;
+  timeframe: string;
+  condition:
+    | { type: "price_cross"; direction: "above" | "below"; value: number }
+    | { type: "rsi"; direction: "above" | "below"; value: number }
+    | { type: "macd_hist"; direction: "above" | "below"; value: number };
+  active: boolean;
+  createdAt: number;
+};
+
+const cryptoPairs = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "ADAUSDT"] as const;
+const timeframes = ["1m", "5m", "15m", "1h", "4h", "1d"] as const;
+
+const numberFmt = (n: number | string, opts: Intl.NumberFormatOptions = {}) => {
+  const num = typeof n === "string" ? Number(n) : n;
+  if (!Number.isFinite(num)) return "-";
+  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 2, ...opts }).format(num);
+};
+
+// ---------------------------------------------
+// Error Boundary (defensive UI)
+// ---------------------------------------------
+class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
+  constructor(props: any) {
+    super(props);
+    this.state = { hasError: false };
+  }
+  static getDerivedStateFromError() { return { hasError: true }; }
+  componentDidCatch(err: any) { console.error("Dashboard error:", err); }
+  render() { return this.state.hasError ? (
+    <div className="p-6 text-slate-300">Algo inesperado aconteceu. Atualize a página.</div>
+  ) : this.props.children; }
+}
+
+// ---------------------------------------------
+// Main Component
+// ---------------------------------------------
+export default function Dashboard() {
+  const [selectedPair, setSelectedPair] = useState<(typeof cryptoPairs)[number]>("BTCUSDT");
+  const [selectedTimeframe, setSelectedTimeframe] = useState<(typeof timeframes)[number]>("1h");
+  const [indicators, setIndicators] = useState<IndicatorsState>({
+    rsi: 50,
+    macd: { macd: 0, signal: 0, histogram: 0 },
+    bb: { upper: 0, middle: 0, lower: 0 },
+  });
+  const [enabledIndicators, setEnabledIndicators] = useState({ rsi: true, macd: true, bb: true });
+  const [isPro, setIsPro] = useState(false); // mock paywall flag
+
+  // Data hooks (mock)
+  const { marketData, loading: marketLoading, error: marketError } = useMockMarketData(cryptoPairs as unknown as string[]);
+  const { priceData, connected } = useMockPriceStream(selectedPair);
+  const { signals, loading: signalsLoading } = useMockSmartSignals(cryptoPairs as unknown as string[]);
+
+  // Alerts (local-only for now; persist later via API)
+  const [alerts, setAlerts] = useState<AlertRule[]>([]);
+  const alertIdRef = useRef(0);
+
+  // Recalculate indicators on pair/timeframe or when price updates
+  useEffect(() => {
+    const updateIndicators = async () => {
+      try {
+        const len = 200;
+        const base = selectedPair === "BTCUSDT" ? 43000 : 2500;
+        const vol = selectedTimeframe === "1m" || selectedTimeframe === "5m" ? 1200 : 800;
+        const mockPrices = Array.from({ length: len }, (_, i) =>
+          base + Math.sin(i * 0.12) * (vol * 0.6) + Math.cos(i * 0.05) * (vol * 0.4) + Math.random() * (vol * 0.2)
+        );
+        const rsi = TechnicalIndicators.calculateRSI(mockPrices);
+        const macd = TechnicalIndicators.calculateMACD(mockPrices);
+        const bb = TechnicalIndicators.calculateBollingerBands(mockPrices);
+        setIndicators({ rsi, macd, bb });
+      } catch (e) {
+        console.error("Error calculating indicators:", e);
+      }
+    };
+    updateIndicators();
+  }, [selectedPair, selectedTimeframe]);
+
+  // Pairs list with live data merged
+  const displayPairs = useMemo(() => {
+    return cryptoPairs.map((symbol) => {
+      const data = marketData.get(symbol as unknown as string);
+      const live = symbol === selectedPair ? priceData : null;
+      const price = Number(live?.price ?? data?.price ?? 0);
+      const change = Number(data?.priceChangePercent ?? 0);
+      return {
+        symbol,
+        name: symbol.replace("USDT", ""),
+        price,
+        change,
+        changeColor: change >= 0 ? "text-green-400" : "text-red-400",
+      };
+    });
+  }, [marketData, priceData, selectedPair]);
+
+  // AI signals (top 3)
+  const displaySignals = useMemo(() => {
+    return (signals ?? []).slice(0, 3).map((s: any) => ({
+      pair: s.pair,
+      signal: s.signal as "BUY" | "SELL" | "HOLD",
+      confidence: s.confidence,
+      reason: s.reason,
+      time: `${Math.max(0, Math.floor((Date.now() - s.timestamp) / 60000))} min ago`,
+    }));
+  }, [signals]);
+
+  // Alert evaluation (local)
+  useEffect(() => {
+    if (!priceData) return;
+    const nowPrice = Number(priceData.price);
+    const notifs: AlertRule[] = [];
+    setAlerts((prev) =>
+      prev.map((a) => {
+        if (!a.active || a.pair !== selectedPair || a.timeframe !== selectedTimeframe) return a;
+        if (a.condition.type === "price_cross") {
+          if (
+            (a.condition.direction === "above" && nowPrice >= a.condition.value) ||
+            (a.condition.direction === "below" && nowPrice <= a.condition.value)
+          ) {
+            notifs.push(a);
+            return { ...a, active: false };
+          }
+        }
+        if (a.condition.type === "rsi") {
+          const passed =
+            (a.condition.direction === "above" && indicators.rsi >= a.condition.value) ||
+            (a.condition.direction === "below" && indicators.rsi <= a.condition.value);
+          if (passed) { notifs.push(a); return { ...a, active: false }; }
+        }
+        if (a.condition.type === "macd_hist") {
+          const h = indicators.macd.histogram;
+          const passed =
+            (a.condition.direction === "above" && h >= a.condition.value) ||
+            (a.condition.direction === "below" && h <= a.condition.value);
+          if (passed) { notifs.push(a); return { ...a, active: false }; }
+        }
+        return a;
+      })
+    );
+    if (notifs.length) {
+      // Simple toast fallback; replace with your toast lib if available
+      console.log("ALERTS TRIGGERED:", notifs.map((n) => n.id));
+    }
+  }, [priceData, indicators, selectedPair, selectedTimeframe]);
+
+  // Helpers
+  const addAlert = (rule: Omit<AlertRule, "id" | "createdAt" | "active">) => {
+    alertIdRef.current += 1;
+    setAlerts((prev) => [
+      { id: String(alertIdRef.current), active: true, createdAt: Date.now(), ...rule },
+      ...prev,
+    ]);
+  };
+
+  return (
+    <ErrorBoundary>
+      <div className="min-h-screen p-4 md:p-6">
+        {/* Header */}
+        <header className="mb-8">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+            <div>
+              <h1 className="text-3xl md:text-4xl font-bold bg-gradient-to-r from-blue-400 via-purple-400 to-pink-400 bg-clip-text text-transparent">
+                GoCripto
+              </h1>
+              <p className="text-slate-400 mt-1">AI-Powered Crypto Analysis Platform</p>
+            </div>
+
+            <div className="flex items-center gap-4">
+              <Badge variant="outline" className="bg-green-500/10 text-green-400 border-green-500/20">
+                ● Live Demo Data
+              </Badge>
+              <Switch checked={isPro} onCheckedChange={setIsPro} aria-label="Toggle PRO" />
+              <span className="text-slate-300 text-sm">{isPro ? "PRO" : "FREE"}</span>
+              <Button variant="outline" className="bg-white/5 border-white/10 hover:bg-white/10">
+                Sign In
+              </Button>
+              <Button className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700">
+                Get PRO
+              </Button>
+            </div>
+          </div>
+        </header>
+
+        {/* Main Grid */}
+        <div className="grid grid-cols-1 xl:grid-cols-4 gap-6">
+          {/* Sidebar */}
+          <div className="xl:col-span-1 space-y-6">
+            {/* Market Overview */}
+            <Card className="bg-white/5 border-white/10 backdrop-blur-xl">
+              <CardHeader>
+                <CardTitle className="text-white flex items-center gap-2">
+                  📊 Market Overview
+                  <Badge variant="outline" className="bg-blue-500/10 text-blue-400 border-blue-500/20 text-xs">
+                    DEMO
+                  </Badge>
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {marketLoading ? (
+                  <div className="text-center py-4">
+                    <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-400 mx-auto"></div>
+                    <p className="text-slate-400 mt-2">Loading market data...</p>
+                  </div>
+                ) : marketError ? (
+                  <div className="text-center py-4">
+                    <p className="text-red-400">Error loading market data</p>
+                    <p className="text-xs text-slate-500 mt-1">{String(marketError)}</p>
+                  </div>
+                ) : (
+                  <ScrollArea className="max-h-[420px] pr-2">
+                    <div className="space-y-3">
+                      {displayPairs.map((pair) => (
+                        <div
+                          key={pair.symbol}
+                          role="button"
+                          aria-label={`Select ${pair.symbol}`}
+                          className={`p-3 rounded-lg cursor-pointer transition-all ${
+                            selectedPair === pair.symbol
+                              ? "bg-blue-500/20 border border-blue-500/30"
+                              : "bg-white/5 hover:bg-white/10"
+                          }`}
+                          onClick={() => setSelectedPair(pair.symbol)}
+                        >
+                          <div className="flex justify-between items-start">
+                            <div>
+                              <p className="font-semibold text-white">{pair.symbol}</p>
+                              <p className="text-xs text-slate-400">{pair.name}</p>
+                            </div>
+                            <div className="text-right">
+                              <p className="font-mono text-white">${numberFmt(pair.price, { maximumFractionDigits: 2 })}</p>
+                              <p className={`text-xs ${pair.changeColor}`}>{numberFmt(pair.change, { maximumFractionDigits: 2 })}%</p>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </ScrollArea>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* SMARTSIGNALS */}
+            <Card className="bg-white/5 border-white/10 backdrop-blur-xl">
+              <CardHeader>
+                <CardTitle className="text-white flex items-center gap-2">
+                  🤖 SMARTSIGNALS
+                  <Badge className="bg-gradient-to-r from-purple-600 to-pink-600 text-xs">AI</Badge>
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {signalsLoading ? (
+                  <div className="text-center py-4">
+                    <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-purple-400 mx-auto"></div>
+                    <p className="text-slate-400 text-sm mt-2">Generating AI signals...</p>
+                  </div>
+                ) : !displaySignals.length ? (
+                  <div className="text-center py-4">
+                    <p className="text-slate-400">No signals available</p>
+                  </div>
+                ) : (
+                  displaySignals.map((s, i) => (
+                    <div key={i} className="p-3 bg-white/5 rounded-lg">
+                      <div className="flex justify-between items-start mb-2">
+                        <span className="text-sm font-medium text-white">{s.pair}</span>
+                        <Badge
+                          className={`text-xs ${
+                            s.signal === "BUY"
+                              ? "bg-green-500/20 text-green-400"
+                              : s.signal === "SELL"
+                              ? "bg-red-500/20 text-red-400"
+                              : "bg-yellow-500/20 text-yellow-400"
+                          }`}
+                        >
+                          {s.signal}
+                        </Badge>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="flex justify-between text-xs">
+                          <span className="text-slate-400">Confidence</span>
+                          <span className="text-white">{numberFmt(s.confidence)}%</span>
+                        </div>
+                        <div className="w-full bg-slate-700 rounded-full h-1">
+                          <div className="bg-gradient-to-r from-blue-500 to-purple-500 h-1 rounded-full" style={{ width: `${Math.min(100, Math.max(0, s.confidence))}%` }} />
+                        </div>
+                        <p className="text-xs text-slate-400 mt-2">{s.reason}</p>
+                        <p className="text-xs text-slate-500">{s.time}</p>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Main Area */}
+          <div className="xl:col-span-3 space-y-6">
+            {/* Controls */}
+            <Card className="bg-white/5 border-white/10 backdrop-blur-xl">
+              <CardContent className="p-4">
+                <div className="flex flex-col md:flex-row gap-4 items-start md:items-center justify-between">
+                  <div className="flex items-center gap-4">
+                    <div>
+                      <label className="text-sm text-slate-400 block mb-1">Trading Pair</label>
+                      <Select value={selectedPair} onValueChange={(v) => setSelectedPair(v as any)}>
+                        <SelectTrigger className="w-44 bg-white/5 border-white/10">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent className="bg-slate-800 border-slate-700">
+                          {cryptoPairs.map((symbol) => (
+                            <SelectItem key={symbol} value={symbol}>
+                              {symbol}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div>
+                      <label className="text-sm text-slate-400 block mb-1">Timeframe</label>
+                      <div className="flex gap-1">
+                        {timeframes.map((tf) => (
+                          <Button
+                            key={tf}
+                            variant={selectedTimeframe === tf ? "default" : "outline"}
+                            size="sm"
+                            className={`text-xs ${selectedTimeframe === tf ? "bg-blue-600 hover:bg-blue-700" : "bg-white/5 border-white/10 hover:bg-white/10"}`}
+                            onClick={() => setSelectedTimeframe(tf)}
+                          >
+                            {tf}
+                          </Button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-4">
+                    <Popover>
+                      <PopoverTrigger asChild>
+                        <Button variant="outline" className="bg-white/5 border-white/10 hover:bg-white/10">
+                          ⚙️ Indicators
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-56 bg-slate-800 border-slate-700 text-white">
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between">
+                            <Label htmlFor="rsi-toggle">RSI</Label>
+                            <Switch id="rsi-toggle" checked={enabledIndicators.rsi} onCheckedChange={(c) => setEnabledIndicators({ ...enabledIndicators, rsi: c })} />
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <Label htmlFor="macd-toggle">MACD</Label>
+                            <Switch id="macd-toggle" checked={enabledIndicators.macd} onCheckedChange={(c) => setEnabledIndicators({ ...enabledIndicators, macd: c })} />
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <Label htmlFor="bb-toggle">Bollinger Bands</Label>
+                            <Switch id="bb-toggle" checked={enabledIndicators.bb} onCheckedChange={(c) => setEnabledIndicators({ ...enabledIndicators, bb: c })} />
+                          </div>
+                        </div>
+                      </PopoverContent>
+                    </Popover>
+
+                    <Dialog>
+                      <DialogTrigger asChild>
+                        <Button variant="outline" className="bg-white/5 border-white/10 hover:bg-white/10">
+                          🔔 Alerts
+                        </Button>
+                      </DialogTrigger>
+                      <DialogContent className="bg-slate-800 border-slate-700 text-white">
+                        <DialogHeader>
+                          <DialogTitle className="text-white">Manage Alerts</DialogTitle>
+                          <DialogDescription className="text-slate-400">
+                            Create and manage your price and indicator alerts.
+                          </DialogDescription>
+                        </DialogHeader>
+                        <div className="space-y-4">
+                          {/* New Alert Form */}
+                          <Card className="bg-white/5 border-white/10">
+                            <CardHeader>
+                              <CardTitle className="text-white text-lg">Create New Alert</CardTitle>
+                            </CardHeader>
+                            <CardContent className="space-y-3">
+                              <div>
+                                <Label htmlFor="alert-pair">Pair</Label>
+                                <Select value={selectedPair} onValueChange={(v) => setSelectedPair(v as any)}>
+                                  <SelectTrigger id="alert-pair" className="w-full bg-white/10 border-white/20">
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent className="bg-slate-700 border-slate-600">
+                                    {cryptoPairs.map((symbol) => (
+                                      <SelectItem key={symbol} value={symbol}>
+                                        {symbol}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                              </div>
+                              <div>
+                                <Label htmlFor="alert-condition">Condition</Label>
+                                <Select defaultValue="price_cross">
+                                  <SelectTrigger id="alert-condition" className="w-full bg-white/10 border-white/20">
+                                    <SelectValue placeholder="Select a condition" />
+                                  </SelectTrigger>
+                                  <SelectContent className="bg-slate-700 border-slate-600">
+                                    <SelectItem value="price_cross">Price Crosses</SelectItem>
+                                    <SelectItem value="rsi">RSI</SelectItem>
+                                    <SelectItem value="macd_hist">MACD Histogram</SelectItem>
+                                    <SelectItem value="smart_signal">SMARTSIGNAL (PRO)</SelectItem>
+                                  </SelectContent>
+                                </Select>
+                              </div>
+                              <div className="flex gap-2">
+                                <Select defaultValue="above">
+                                  <SelectTrigger className="w-1/2 bg-white/10 border-white/20">
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent className="bg-slate-700 border-slate-600">
+                                    <SelectItem value="above">Above</SelectItem>
+                                    <SelectItem value="below">Below</SelectItem>
+                                  </SelectContent>
+                                </Select>
+                                <Input type="number" placeholder="Value" className="w-1/2 bg-white/10 border-white/20 text-white" />
+                              </div>
+                              <Button className="w-full bg-blue-600 hover:bg-blue-700">Create Alert</Button>
+                            </CardContent>
+                          </Card>
+
+                          {/* Existing Alerts */}
+                          <h3 className="text-white text-lg font-semibold">Your Active Alerts</h3>
+                          {alerts.length === 0 ? (
+                            <p className="text-slate-400 text-center">No active alerts. Create one above!</p>
+                          ) : (
+                            <ScrollArea className="h-48 pr-2">
+                              <div className="space-y-2">
+                                {alerts.map((alert) => (
+                                  <div key={alert.id} className="p-3 bg-white/5 rounded-lg flex justify-between items-center">
+                                    <div>
+                                      <p className="text-white font-medium">{alert.pair} - {alert.condition.type === 'price_cross' ? `Price ${alert.condition.direction} ${numberFmt(alert.condition.value)}` : alert.condition.type === 'rsi' ? `RSI ${alert.condition.direction} ${alert.condition.value}` : `MACD Hist ${alert.condition.direction} ${alert.condition.value}`}</p>
+                                      <p className="text-xs text-slate-400">Created: {new Date(alert.createdAt).toLocaleString()}</p>
+                                    </div>
+                                    <Button variant="destructive" size="sm" onClick={() => setAlerts(alerts.filter(a => a.id !== alert.id))}>Deactivate</Button>
+                                  </div>
+                                ))}
+                              </div>
+                            </ScrollArea>
+                          )}
+                        </div>
+                        <DialogFooter>
+                          <Button variant="outline" className="bg-white/5 border-white/10 hover:bg-white/10">Close</Button>
+                        </DialogFooter>
+                      </DialogContent>
+                    </Dialog>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* TradingView Chart */}
+            <Card className="bg-white/5 border-white/10 backdrop-blur-xl h-[500px] flex items-center justify-center">
+              <TradingViewChart symbol={selectedPair} interval={selectedTimeframe} />
+            </Card>
+
+            {/* Indicators & AI Analysis */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* Technical Indicators */}
+              <Card className="bg-white/5 border-white/10 backdrop-blur-xl">
+                <CardHeader>
+                  <CardTitle className="text-white flex items-center gap-2">
+                    📈 Technical Indicators
+                    <Badge variant="outline" className="bg-green-500/10 text-green-400 border-green-500/20 text-xs">
+                      LIVE
+                    </Badge>
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {enabledIndicators.rsi && (
+                    <div className="p-3 bg-white/5 rounded-lg">
+                      <p className="text-white font-medium">RSI: {numberFmt(indicators.rsi)}</p>
+                      <div className="w-full bg-slate-700 rounded-full h-2 mt-1">
+                        <div
+                          className={`h-2 rounded-full ${
+                            indicators.rsi > 70 ? "bg-red-500" : indicators.rsi < 30 ? "bg-green-500" : "bg-blue-500"
+                          }`}
+                          style={{ width: `${Math.min(100, Math.max(0, indicators.rsi))}%` }}
+                        />
+                      </div>
+                      <p className="text-xs text-slate-400 mt-1">
+                        Relative Strength Index. {indicators.rsi > 70 ? "Overbought!" : indicators.rsi < 30 ? "Oversold!" : "Neutral."}
+                      </p>
+                    </div>
+                  )}
+                  {enabledIndicators.macd && (
+                    <div className="p-3 bg-white/5 rounded-lg">
+                      <p className="text-white font-medium">MACD</p>
+                      <p className="text-xs text-slate-400">Line: {numberFmt(indicators.macd.macd)}, Signal: {numberFmt(indicators.macd.signal)}, Histogram: {numberFmt(indicators.macd.histogram)}</p>
+                      <p className="text-xs text-slate-400 mt-1">
+                        Moving Average Convergence Divergence. Measures momentum.
+                      </p>
+                    </div>
+                  )}
+                  {enabledIndicators.bb && (
+                    <div className="p-3 bg-white/5 rounded-lg">
+                      <p className="text-white font-medium">Bollinger Bands</p>
+                      <p className="text-xs text-slate-400">Upper: {numberFmt(indicators.bb.upper)}, Middle: {numberFmt(indicators.bb.middle)}, Lower: {numberFmt(indicators.bb.lower)}</p>
+                      <p className="text-xs text-slate-400 mt-1">
+                        Measures market volatility.
+                      </p>
+                    </div>
+                  )}
+                  {!enabledIndicators.rsi && !enabledIndicators.macd && !enabledIndicators.bb && (
+                    <p className="text-slate-400 text-center py-4">No indicators enabled. Use the ⚙️ Indicators button to enable them.</p>
+                  )}
+                </CardContent>
+              </Card>
+
+              {/* AI Analysis */}
+              <Card className="bg-white/5 border-white/10 backdrop-blur-xl">
+                <CardHeader>
+                  <CardTitle className="text-white flex items-center gap-2">
+                    🧠 AI Analysis
+                    <Badge className="bg-gradient-to-r from-purple-600 to-pink-600 text-xs">PRO</Badge>
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {isPro ? (
+                    <div className="space-y-2">
+                      <p className="text-slate-300">Detailed AI-powered market analysis for {selectedPair} on {selectedTimeframe} timeframe:</p>
+                      <p className="text-slate-400 text-sm">
+                        Based on current market data and technical indicators, the AI suggests a **{displaySignals[0]?.signal || 'HOLD'}** position for {selectedPair}.
+                        The confidence level is **{displaySignals[0]?.confidence || 'N/A'}%**.
+                        <br />
+                        Reason: {displaySignals[0]?.reason || 'No detailed reason available.'}
+                      </p>
+                      <Button variant="outline" className="bg-white/5 border-white/10 hover:bg-white/10 w-full">
+                        Generate Custom Analysis
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="text-center py-4">
+                      <p className="text-slate-400">Upgrade to PRO to unlock detailed AI analysis and personalized insights.</p>
+                      <Button className="mt-4 bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700">
+                        Get PRO Now
+                      </Button>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            </div>
+          </div>
+        </div>
+      </div>
+    </ErrorBoundary>
+  );
+}
+
+
